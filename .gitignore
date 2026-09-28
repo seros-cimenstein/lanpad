@@ -1,0 +1,5 @@
+/.sdk/
+/platform-tools/
+/lanpad.apk
+/android/build/
+__pycache__/
