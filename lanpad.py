@@ -36,7 +36,8 @@ from evdev import AbsInfo, UInput, ecodes as e
 
 HERE = Path(__file__).resolve().parent
 APK = HERE / "lanpad.apk"
-APP_ACTIVITY = "dev.lanpad/.MainActivity"
+APP_PACKAGE = "dev.lanpad"
+APP_ACTIVITY = f"{APP_PACKAGE}/.MainActivity"
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "lanpad"
 KEY_FILE = CONFIG_DIR / "key"
 UNIT_NAME = "lanpad.service"
@@ -260,6 +261,7 @@ class Server:
         self.pad: Touchpad | None = None
         self.last_frame = 0.0
         self.peer: str | None = None
+        self.last_packet = 0.0  # any authenticated packet, heartbeats included
 
     def mac(self, data: bytes) -> bytes:
         return hmac.new(self.key, data, hashlib.sha256).digest()[:MAC_LEN]
@@ -321,6 +323,7 @@ class Server:
         body, tag = data[:-MAC_LEN], data[-MAC_LEN:]
         if not hmac.compare_digest(self.mac(body), tag):
             return
+        self.last_packet = now
         ptype, body = body[4], body[5:]
         if ptype == HELLO and len(body) == 20:
             nonce, sess, w, h = struct.unpack(">8s8sHH", body)
@@ -360,10 +363,13 @@ class Server:
         self.udp.close()
 
 
-def usb_link_loop(adb: str, port: int) -> None:
-    """Keep `adb reverse tcp:PORT` set on every USB-attached phone (the mapping is lost on
-    each reconnect) and start the app when a phone shows up without it running."""
+def usb_link_loop(adb: str, port: int, idle_for) -> None:
+    """For every USB-attached phone: keep `adb reverse tcp:PORT` set (the mapping is lost on
+    each reconnect), start the app when it isn't running, and wake the phone if it went to
+    sleep while LanPad was in front (a grip easily presses the power button; an app cannot
+    block that). Leaving the app (Home/Back) before turning the screen off opts out."""
     linked: set[str] = set()
+    last_wake: dict[str, float] = {}
 
     def run(*cmd: str) -> subprocess.CompletedProcess:
         return subprocess.run(cmd, capture_output=True, text=True, timeout=10)
@@ -373,15 +379,22 @@ def usb_link_loop(adb: str, port: int) -> None:
             out = run(adb, "devices").stdout
             serials = {ln.split()[0] for ln in out.splitlines()[1:] if ln.endswith("\tdevice")}
             for serial in serials:
-                if f"tcp:{port}" in run(adb, "-s", serial, "reverse", "--list").stdout:
-                    continue
-                if run(adb, "-s", serial, "reverse", f"tcp:{port}", f"tcp:{port}").returncode != 0:
-                    continue
-                if serial not in linked:
-                    print(f"USB: linked {serial}")
-                    linked.add(serial)
-                if not run(adb, "-s", serial, "shell", "pidof", APP_ACTIVITY.split("/")[0]).stdout.strip():
-                    run(adb, "-s", serial, "shell", "am", "start", "-n", APP_ACTIVITY)
+                a = (adb, "-s", serial)
+                if f"tcp:{port}" not in run(*a, "reverse", "--list").stdout:
+                    if run(*a, "reverse", f"tcp:{port}", f"tcp:{port}").returncode != 0:
+                        continue
+                    if serial not in linked:
+                        print(f"USB: linked {serial}")
+                        linked.add(serial)
+                    if not run(*a, "shell", "pidof", APP_PACKAGE).stdout.strip():
+                        run(*a, "shell", "am", "start", "-n", APP_ACTIVITY)
+                # The app heartbeats every 2 s while connected; silence means it is not running.
+                if idle_for() > 3 and time.monotonic() - last_wake.get(serial, 0.0) > 5:
+                    awake = "Awake" in run(*a, "shell", "dumpsys power | grep mWakefulness=").stdout
+                    if not awake and APP_PACKAGE in run(*a, "shell", "dumpsys window | grep mFocusedApp=").stdout:
+                        run(*a, "shell", "input", "keyevent", "KEYCODE_WAKEUP")
+                        last_wake[serial] = time.monotonic()
+                        print(f"USB: {serial} went to sleep with LanPad in front; woke it")
         except (subprocess.SubprocessError, OSError) as ex:
             print(f"USB: adb error: {ex}")
         time.sleep(1)
@@ -397,7 +410,8 @@ def cmd_serve(args) -> None:
     signal.signal(signal.SIGTERM, on_signal)
     adb = find_adb(required=False) if not args.no_usb else None
     if adb:
-        threading.Thread(target=usb_link_loop, args=(adb, args.port), daemon=True).start()
+        threading.Thread(target=usb_link_loop, daemon=True,
+                         args=(adb, args.port, lambda: time.monotonic() - server.last_packet)).start()
     print(f"listening: Wi-Fi udp/{args.port}" + (", USB via adb reverse" if adb else "")
           + "; open LanPad on the phone")
     try:

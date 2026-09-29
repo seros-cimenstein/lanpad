@@ -26,7 +26,10 @@ three/four-finger swipes. Your compositor's touchpad settings apply to it as usu
 Hold the phone in landscape with its top on the left.
 
 - **USB**: works whenever the phone is plugged in. The daemon keeps `adb reverse` set up
-  across reconnects and opens the app when the phone appears.
+  across reconnects and opens the app when the phone appears. If the phone goes to sleep
+  while LanPad is in front (a grip easily presses the power button), the daemon wakes it
+  and LanPad reappears over the lock screen; to turn the phone off on purpose, leave the
+  app (Home/Back) first.
 - **Wi-Fi**: works when the cable is out; the app finds the PC by broadcast. If a firewall
   is active, allow the port once, e.g. `sudo ufw allow in on wlan0 to any port 47474 proto udp`.
 
