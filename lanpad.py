@@ -100,11 +100,54 @@ class OneEuro2D:
         return self.pos
 
 
+class SpikeGate:
+    """Rejects short single-axis glitches. The phone's panel occasionally reports one axis
+    hundreds of pixels off for 1-2 frames while the other axis tracks normally; replayed
+    as motion, that teleports the cursor. A finger moves continuously within one track, so
+    a sample far from the velocity prediction is held back (the prediction is used instead)
+    for up to SPIKE_MAX_FRAMES frames; if it persists longer it is accepted as real."""
+
+    def __init__(self) -> None:
+        self.good: float | None = None
+        self.t = 0.0
+        self.vel = 0.0
+        self.suspect = 0
+
+    def __call__(self, v: float, t: float) -> float:
+        if self.good is None:
+            self.good, self.t = v, t
+            return v
+        dt = max(t - self.t, 1e-3)
+        expected = self.good + self.vel * dt
+        if abs(v - expected) > SPIKE_PX + 0.5 * abs(self.vel * dt) and self.suspect < SPIKE_MAX_FRAMES:
+            self.suspect += 1
+            return expected
+        self.suspect = 0
+        self.vel = 0.5 * self.vel + 0.5 * (v - self.good) / dt
+        self.good, self.t = v, t
+        return v
+
+
+class FingerFilter:
+    """Per-finger input cleanup: glitch rejection per axis, then 1€ smoothing."""
+
+    def __init__(self) -> None:
+        self.gx, self.gy = SpikeGate(), SpikeGate()
+        self.smooth = OneEuro2D(SMOOTH_MIN_CUTOFF, SMOOTH_BETA)
+
+    def __call__(self, x: int, y: int, t: float) -> tuple[float, float]:
+        return self.smooth(self.gx(x, t), self.gy(y, t), t)
+
+
 # Output units per phone pixel, so smoothed sub-pixel positions survive rounding.
 SUBUNITS = 8
 # 1€ tuning, in phone pixels (~0.12 mm): 1 Hz cutoff when still, +0.02 Hz per px/s of speed.
 SMOOTH_MIN_CUTOFF = 1.0
 SMOOTH_BETA = 0.02
+# Glitch rejection: deviation from the predicted position (px, ~7 mm) beyond which a
+# sample is suspect, and how many consecutive suspect frames are held back at most.
+SPIKE_PX = 60
+SPIKE_MAX_FRAMES = 2
 
 
 class Touchpad:
@@ -129,7 +172,7 @@ class Touchpad:
         self.ui = _UInput(caps, name=DEVICE_NAME, vendor=0x1bbb, product=0x7470, version=1,
                           bustype=e.BUS_VIRTUAL, input_props=[e.INPUT_PROP_POINTER])
         self.slots: list[tuple[int, int, int] | None] = [None] * MAX_SLOTS  # (track, out x, out y)
-        self.filters: dict[int, OneEuro2D] = {}
+        self.filters: dict[int, FingerFilter] = {}
         self.cur_slot = 0
         self.next_tid = 0
         self.ntouch = 0
@@ -159,7 +202,7 @@ class Touchpad:
                 select(si)
                 ui.write(e.EV_ABS, e.ABS_MT_TRACKING_ID, self.next_tid)
                 self.next_tid = (self.next_tid + 1) & 0xFFFF
-                self.filters[track] = OneEuro2D(SMOOTH_MIN_CUTOFF, SMOOTH_BETA)
+                self.filters[track] = FingerFilter()
             fx, fy = self.filters[track](x, y, now)
             ox, oy = round(fx * SUBUNITS), round(fy * SUBUNITS)
             if self.slots[si] is not None and self.slots[si][1:] == (ox, oy):
