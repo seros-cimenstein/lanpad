@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import hmac
+import json
 import math
 import os
 import re
@@ -30,6 +31,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from pathlib import Path
 
 from evdev import AbsInfo, UInput, ecodes as e
@@ -41,6 +43,7 @@ APP_ACTIVITY = f"{APP_PACKAGE}/.MainActivity"
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "lanpad"
 KEY_FILE = CONFIG_DIR / "key"
 UNIT_NAME = "lanpad.service"
+LANMOUSE_CONFIG = Path.home() / ".config" / "lanmouse-indicator" / "config.json"
 DEFAULT_PORT = 47474
 
 DEVICE_NAME = "LanPad"
@@ -242,11 +245,223 @@ def load_key() -> bytes:
         sys.exit(f"no pairing key at {KEY_FILE}; run: {sys.argv[0]} pair")
 
 
+# ---------------------------------------------------------------- remote (lanmouse) mode
+
+POINTER_NAME = "LanPad pointer"  # lanmouse's sender forwards it when its mouse_match lists this name
+TAP_MAX_S = 0.18          # libinput's tap timeout
+TAP_MAX_MOVE_MM = 1.5     # more travel than this makes a touch a move, not a tap
+TAP_DRAG_WINDOW_S = 0.18  # a touch starting this soon after a tap is a double-tap or tap-and-drag
+COUNTS_PER_MM = 1000 / 25.4   # like a 1000 dpi mouse; the receiver's libinput adds acceleration
+SCROLL_HIRES_PER_MM = 12      # 120 hi-res units = one wheel detent per 10 mm of two-finger travel
+LANMOUSE_POLL_S = 0.1
+
+
+class Pointer:
+    """Relative uinput mouse. lanmouse only carries mouse events (REL + buttons), so this is
+    what a remote target gets instead of the touchpad."""
+
+    def __init__(self) -> None:
+        caps = {
+            e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE],
+            e.EV_REL: [e.REL_X, e.REL_Y, e.REL_WHEEL, e.REL_HWHEEL, e.REL_WHEEL_HI_RES, e.REL_HWHEEL_HI_RES],
+        }
+        self.ui = _UInput(caps, name=POINTER_NAME, vendor=0x1bbb, product=0x7471, version=1,
+                          bustype=e.BUS_VIRTUAL)
+        self.down: set[int] = set()
+
+    def rel(self, code: int, value: int) -> None:
+        if value:
+            self.ui.write(e.EV_REL, code, value)
+
+    def button(self, code: int, pressed: bool) -> None:
+        self.ui.write(e.EV_KEY, code, int(pressed))
+        self.ui.syn()
+        (self.down.add if pressed else self.down.discard)(code)
+
+    def click(self, code: int) -> None:
+        self.button(code, True)
+        self.button(code, False)
+
+    def release_all(self) -> None:
+        for code in list(self.down):
+            self.button(code, False)
+
+    def close(self) -> None:
+        self.release_all()
+        self.ui.close()
+
+
+class RemoteGestures:
+    """Touch frames -> relative mouse events, following libinput's touchpad conventions:
+    one finger moves the pointer; tap / two-finger tap / three-finger tap = left / right /
+    middle click; double-tap; tap then touch-and-move (or hold) = drag; two fingers scroll.
+    A single tap's click is deferred by TAP_DRAG_WINDOW_S to tell it from those, as libinput does."""
+
+    def __init__(self, pointer: Pointer, mm_per_px: float, gain: float, natural_scroll: bool):
+        self.ptr = pointer
+        self.mm = mm_per_px
+        self.gain = gain
+        self.natural = natural_scroll
+        self.filters: dict[int, FingerFilter] = {}
+        self.pos: dict[int, tuple[float, float]] = {}    # filtered positions, px
+        self.start: dict[int, tuple[float, float]] = {}
+        self.ntouch = 0
+        self.seq_start = 0.0
+        self.seq_fingers = 0
+        self.seq_moved = False
+        self.after_tap = False       # this touch began within TAP_DRAG_WINDOW_S of a tap
+        self.click_due: float | None = None
+        self.dragging = False
+        self.move_rem = [0.0, 0.0]
+        self.scroll_rem = [0.0, 0.0]
+        self.hires_sum = [0, 0]      # per touch, to emit legacy wheel detents every 120
+
+    def deadline(self) -> float | None:
+        return self.click_due
+
+    def tick(self, now: float) -> None:
+        if self.click_due is not None and now >= self.click_due:
+            self.click_due = None
+            self.ptr.click(e.BTN_LEFT)
+
+    def reset(self) -> None:
+        """Drop all touch state (target switched away); no clicks are delivered late."""
+        self.click_due = None
+        self.after_tap = self.dragging = False
+        self.filters.clear()
+        self.pos.clear()
+        self.start.clear()
+        self.ntouch = 0
+        self.ptr.release_all()
+
+    def frame(self, contacts: dict[int, tuple[int, int]], now: float) -> None:
+        self.tick(now)
+        new: dict[int, tuple[float, float]] = {}
+        for track, (x, y) in contacts.items():
+            f = self.filters.get(track)
+            if f is None:
+                f = self.filters[track] = FingerFilter()
+            new[track] = f(x, y, now)
+        for track in [t for t in self.filters if t not in contacts]:
+            del self.filters[track]
+            self.start.pop(track, None)
+        n = len(new)
+        if self.ntouch == 0 and n:
+            self._begin(now, n)
+        if n:
+            for track, p in new.items():
+                self.start.setdefault(track, p)
+            self.seq_fingers = max(self.seq_fingers, n)
+            if not self.seq_moved and any(
+                    math.hypot(p[0] - self.start[t][0], p[1] - self.start[t][1]) * self.mm > TAP_MAX_MOVE_MM
+                    for t, p in new.items()):
+                self.seq_moved = True
+            if n == 1 and self.after_tap and not self.dragging and (
+                    self.seq_moved or now - self.seq_start > TAP_MAX_S):
+                self.after_tap = False
+                self.dragging = True
+                self.ptr.button(e.BTN_LEFT, True)
+            common = [t for t in new if t in self.pos]
+            if common and n == self.ntouch:  # finger count changes are not motion
+                dx = sum(new[t][0] - self.pos[t][0] for t in common) / len(common) * self.mm
+                dy = sum(new[t][1] - self.pos[t][1] for t in common) / len(common) * self.mm
+                if n == 1 and not self.after_tap:  # after a tap, hold motion until drag/double-tap is decided
+                    self._move(dx, dy)
+                elif n == 2:
+                    self._scroll(dx, dy)
+        self.pos = new
+        if self.ntouch and not n:
+            self._end(now)
+        self.ntouch = n
+
+    def _begin(self, now: float, n: int) -> None:
+        self.seq_start, self.seq_fingers, self.seq_moved = now, n, False
+        self.scroll_rem = [0.0, 0.0]
+        self.hires_sum = [0, 0]
+        if self.click_due is not None:
+            self.click_due = None
+            if n == 1:
+                self.after_tap = True
+            else:
+                self.ptr.click(e.BTN_LEFT)  # tap followed by a multi-finger gesture
+
+    def _end(self, now: float) -> None:
+        if self.dragging:
+            self.dragging = False
+            self.ptr.button(e.BTN_LEFT, False)
+            return
+        tap = now - self.seq_start <= TAP_MAX_S and not self.seq_moved
+        if self.after_tap:
+            self.after_tap = False
+            self.ptr.click(e.BTN_LEFT)          # the first tap
+            if tap and self.seq_fingers == 1:
+                self.ptr.click(e.BTN_LEFT)      # double-tap
+            return
+        if tap:
+            if self.seq_fingers == 1:
+                self.click_due = now + TAP_DRAG_WINDOW_S
+            elif self.seq_fingers == 2:
+                self.ptr.click(e.BTN_RIGHT)
+            else:
+                self.ptr.click(e.BTN_MIDDLE)
+
+    def _move(self, dx_mm: float, dy_mm: float) -> None:
+        out = []
+        for i, d in enumerate((dx_mm, dy_mm)):
+            v = d * COUNTS_PER_MM * self.gain + self.move_rem[i]
+            out.append(int(v))
+            self.move_rem[i] = v - int(v)
+        if out[0] or out[1]:
+            self.ptr.rel(e.REL_X, out[0])
+            self.ptr.rel(e.REL_Y, out[1])
+            self.ptr.ui.syn()
+
+    def _scroll(self, dx_mm: float, dy_mm: float) -> None:
+        # REL_WHEEL > 0 scrolls up, REL_HWHEEL > 0 scrolls right. Natural scrolling moves the
+        # content with the fingers: fingers down -> scroll up, fingers left -> scroll right.
+        sign = 1 if self.natural else -1
+        wheel = (sign * dy_mm, -sign * dx_mm)
+        emitted = False
+        for i, (hi, lo) in enumerate(((e.REL_WHEEL_HI_RES, e.REL_WHEEL), (e.REL_HWHEEL_HI_RES, e.REL_HWHEEL))):
+            v = wheel[i] * SCROLL_HIRES_PER_MM + self.scroll_rem[i]
+            step = int(v)
+            self.scroll_rem[i] = v - step
+            if not step:
+                continue
+            before = int(self.hires_sum[i] / 120)
+            self.hires_sum[i] += step
+            self.ptr.rel(hi, step)
+            self.ptr.rel(lo, int(self.hires_sum[i] / 120) - before)
+            emitted = True
+        if emitted:
+            self.ptr.ui.syn()
+
+
+def lanmouse_target_loop(status_url: str, token: str, server: "Server") -> None:
+    """Follow lanmouse's keyboard-driven target ('local' or a receiver name)."""
+    last = None
+    while True:
+        try:
+            req = urllib.request.Request(status_url, headers={"X-Lanmouse-Token": token})
+            with urllib.request.urlopen(req, timeout=1) as resp:
+                target = str(json.load(resp).get("target", "local"))
+        except (OSError, ValueError):
+            target = "local"  # sender unreachable: behave as a plain local touchpad
+        if target != last:
+            print(f"lanmouse: target {target}")
+            last = target
+        server.target = target
+        time.sleep(LANMOUSE_POLL_S)
+
+
 class Server:
     """Accepts the app's packets over Wi-Fi (UDP, any interface) and over USB (TCP on
-    loopback, reached by the phone through `adb reverse`; TCP frames are u16-length prefixed)."""
+    loopback, reached by the phone through `adb reverse`; TCP frames are u16-length prefixed).
+    Frames drive the local touchpad, or — while lanmouse targets another machine — the
+    relative "LanPad pointer" that lanmouse forwards there."""
 
-    def __init__(self, key: bytes, port: int, diagonal: float):
+    def __init__(self, key: bytes, port: int, diagonal: float, pointer: Pointer | None,
+                 remote_gain: float, natural_scroll: bool):
         self.key = key
         self.diagonal = diagonal
         self.sel = selectors.DefaultSelector()
@@ -262,6 +477,12 @@ class Server:
         self.last_frame = 0.0
         self.peer: str | None = None
         self.last_packet = 0.0  # any authenticated packet, heartbeats included
+        self.pointer = pointer
+        self.remote_gain = remote_gain
+        self.natural_scroll = natural_scroll
+        self.gestures: RemoteGestures | None = None
+        self.target = "local"   # written by lanmouse_target_loop
+        self.remote = False
 
     def mac(self, data: bytes) -> bytes:
         return hmac.new(self.key, data, hashlib.sha256).digest()[:MAC_LEN]
@@ -272,7 +493,11 @@ class Server:
 
     def serve(self) -> None:
         while True:
-            for key, _ in self.sel.select(timeout=0.05):
+            timeout = 0.05
+            due = self.gestures.deadline() if self.gestures else None
+            if due is not None:
+                timeout = min(timeout, max(0.0, due - time.monotonic()))
+            for key, _ in self.sel.select(timeout=timeout):
                 now = time.monotonic()
                 if key.data == "udp":
                     data, addr = self.udp.recvfrom(1024)
@@ -285,8 +510,29 @@ class Server:
                     self.sel.register(conn, selectors.EVENT_READ, "tcp")
                 else:
                     self.read_tcp(key.fileobj, now)
-            if self.pad and self.pad.ntouch and time.monotonic() - self.last_frame > TOUCH_TIMEOUT:
-                self.pad.frame({}, time.monotonic())
+            now = time.monotonic()
+            self.sync_mode()
+            if self.gestures:
+                self.gestures.tick(now)
+            sink = self.sink()
+            if sink and sink.ntouch and now - self.last_frame > TOUCH_TIMEOUT:
+                sink.frame({}, now)
+
+    def sink(self) -> Touchpad | RemoteGestures | None:
+        return self.gestures if self.remote else self.pad
+
+    def sync_mode(self) -> None:
+        """Switch between local touchpad and remote pointer when lanmouse's target changes,
+        lifting fingers on the side being left so nothing stays pressed."""
+        remote = self.target != "local" and self.gestures is not None
+        if remote == self.remote:
+            return
+        if remote and self.pad:
+            self.pad.frame({}, time.monotonic())
+        elif not remote and self.gestures:
+            self.gestures.reset()
+        self.remote = remote
+        print("phone now drives " + (f"lanmouse target '{self.target}'" if remote else "this PC"))
 
     def read_tcp(self, conn: socket.socket, now: float) -> None:
         try:
@@ -336,6 +582,10 @@ class Server:
                 if self.pad:
                     self.pad.close()
                 self.pad = Touchpad(w, h, self.diagonal)
+                if self.pointer:
+                    mm_per_px = self.diagonal * 25.4 / math.hypot(w, h)
+                    self.gestures = RemoteGestures(self.pointer, mm_per_px, self.remote_gain,
+                                                   self.natural_scroll)
                 print(f"touchpad '{DEVICE_NAME}' ready: {w}x{h}")
             if self.peer != via:
                 self.peer = via
@@ -352,11 +602,14 @@ class Server:
             st[0] = seq
             contacts = {tid: (x, y) for tid, x, y in struct.iter_unpack(">BHH", body[13:])}
             self.last_frame = now
-            self.pad.frame(contacts, now)
+            self.sync_mode()
+            self.sink().frame(contacts, now)
 
     def close(self) -> None:
         if self.pad:
             self.pad.close()
+        if self.pointer:
+            self.pointer.close()
         for conn in self.tcp_bufs:
             conn.close()
         self.listener.close()
@@ -400,9 +653,23 @@ def usb_link_loop(adb: str, port: int, idle_for) -> None:
         time.sleep(1)
 
 
+def load_lanmouse(path: Path) -> tuple[str, str] | None:
+    """(status_url, token) from a lanmouse-indicator config, or None if there is none."""
+    try:
+        cfg = json.loads(path.read_text())
+        return str(cfg["status_url"]), str(cfg["token"])
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, KeyError) as ex:
+        sys.exit(f"cannot use lanmouse config {path}: {ex}")
+
+
 def cmd_serve(args) -> None:
     sys.stdout.reconfigure(line_buffering=True)
-    server = Server(load_key(), args.port, args.diagonal)
+    lanmouse = None if args.no_lanmouse else load_lanmouse(Path(args.lanmouse).expanduser())
+    pointer = Pointer() if lanmouse else None
+    server = Server(load_key(), args.port, args.diagonal, pointer, args.remote_gain,
+                    args.remote_natural_scroll)
 
     def on_signal(*_):
         raise KeyboardInterrupt
@@ -412,6 +679,9 @@ def cmd_serve(args) -> None:
     if adb:
         threading.Thread(target=usb_link_loop, daemon=True,
                          args=(adb, args.port, lambda: time.monotonic() - server.last_packet)).start()
+    if lanmouse:
+        threading.Thread(target=lanmouse_target_loop, args=(*lanmouse, server), daemon=True).start()
+        print(f"lanmouse: following {lanmouse[0]}; remote targets get '{POINTER_NAME}'")
     print(f"listening: Wi-Fi udp/{args.port}" + (", USB via adb reverse" if adb else "")
           + "; open LanPad on the phone")
     try:
@@ -475,6 +745,15 @@ def cmd_pair(args) -> None:
 
 # ---------------------------------------------------------------- service
 
+def serve_flags(args) -> list[str]:
+    """The serve options in `args`, as command-line flags for the unit file."""
+    flags = ["--diagonal", str(args.diagonal), "--remote-gain", str(args.remote_gain),
+             "--lanmouse", args.lanmouse,
+             "--remote-natural-scroll" if args.remote_natural_scroll else "--no-remote-natural-scroll"]
+    flags += ["--no-usb"] * args.no_usb + ["--no-lanmouse"] * args.no_lanmouse
+    return flags
+
+
 def cmd_install_service(args) -> None:
     unit_dir = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "systemd" / "user"
     unit_dir.mkdir(parents=True, exist_ok=True)
@@ -484,7 +763,7 @@ PartOf=graphical-session.target
 After=graphical-session.target
 
 [Service]
-ExecStart={sys.executable} {Path(__file__).resolve()} --port {args.port} serve --diagonal {args.diagonal}{" --no-usb" if args.no_usb else ""}
+ExecStart={sys.executable} {Path(__file__).resolve()} --port {args.port} serve {" ".join(serve_flags(args))}
 Restart=on-failure
 RestartSec=2
 
@@ -512,6 +791,16 @@ def main() -> None:
                             "for acceleration and gestures (default 5.0)")
         p.add_argument("--no-usb", action="store_true",
                        help="Wi-Fi only: don't manage `adb reverse` for USB-connected phones")
+        p.add_argument("--lanmouse", default=str(LANMOUSE_CONFIG),
+                       help="lanmouse-indicator config with status_url and token; while lanmouse "
+                            f"targets another machine the phone drives '{POINTER_NAME}' instead "
+                            "(default %(default)s, ignored if missing)")
+        p.add_argument("--no-lanmouse", action="store_true", help="never follow lanmouse")
+        p.add_argument("--remote-gain", type=float, default=0.7,
+                       help="pointer speed on lanmouse targets; 1.0 = finger travel counted like a "
+                            "1000 dpi mouse (default %(default)s)")
+        p.add_argument("--remote-natural-scroll", action=argparse.BooleanOptionalAction, default=True,
+                       help="natural two-finger scrolling on lanmouse targets (default on)")
     argv = sys.argv[1:]
     args = ap.parse_args(argv)
     if args.cmd is None:

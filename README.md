@@ -35,10 +35,27 @@ Hold the phone in landscape with its top on the left.
 
 Logs: `journalctl --user -u lanpad.service -f`
 
+## Following lanmouse between machines
+
+If a [lanmouse](../lanmouse) sender runs on this PC, LanPad follows its keyboard-driven
+target (read from `~/.config/lanmouse-indicator/config.json`: `status_url`, `token`):
+
+- target `local`: the phone is this PC's native touchpad, as above;
+- target is a receiver (`laptop`, `desktop`, …): the phone drives a relative mouse,
+  `LanPad pointer`, which lanmouse grabs and forwards over its existing connection. The sender's
+  `mouse_match` must list it, e.g. `["Logitech M215", "LanPad pointer"]`.
+
+lanmouse only carries mouse events, so on a receiver LanPad interprets gestures itself, with
+libinput's conventions: move, tap = left click, two-finger tap = right, three-finger tap =
+middle, double-tap, tap-and-drag, two-finger (natural) scrolling. Pinch and three/four-finger
+swipes stay local-only.
+
 ## Options
 
 `--diagonal INCHES` (serve / install-service): the phone's screen size, so libinput knows the
 pad's physical size for acceleration and gesture distances (default 5.0).
+`--remote-gain` (default 0.7) and `--[no-]remote-natural-scroll`: pointer speed and scroll
+direction on lanmouse receivers. `--lanmouse PATH` / `--no-lanmouse`: lanmouse integration.
 `--no-usb`: Wi-Fi only. `--port`: UDP/TCP port (default 47474).
 
 ## How it works
