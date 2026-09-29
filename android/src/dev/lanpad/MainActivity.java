@@ -51,6 +51,7 @@ public class MainActivity extends Activity {
     static final byte HELLO = 1, WELCOME = 2, FRAME = 3, RESYNC = 4;
     static final int MAC_LEN = 16;
     static final long HEARTBEAT_MS = 2000, SEARCH_MS = 1000, LOST_AFTER_MS = 7000, RESEND_MS = 40;
+    static final long TCP_STALE_MS = 5000;  // USB link with no reply from the PC this long is dead
 
     private SharedPreferences prefs;
     private TouchView view;
@@ -71,7 +72,8 @@ public class MainActivity extends Activity {
     private long lastWelcome;
     private long lastFrameSent;
     private boolean connected;
-    private int viewW, viewH;
+    private volatile int viewW, viewH;  // written on the UI thread, read on the net thread
+    private long tcpUpAt;
     private int[] curIds = new int[0], curXs = new int[0], curYs = new int[0];
     private final SecureRandom random = new SecureRandom();
 
@@ -277,6 +279,7 @@ public class MainActivity extends Activity {
         try {
             tcpOut = s.getOutputStream();
             tcp = s;
+            tcpUpAt = SystemClock.uptimeMillis();
         } catch (Exception e) {
             return;
         }
@@ -335,6 +338,11 @@ public class MainActivity extends Activity {
     private final Runnable heartbeat = new Runnable() {
         @Override
         public void run() {
+            // An adb tunnel can stay open while no longer carrying anything back from the PC;
+            // drop it so usbLoop dials a fresh one.
+            if (tcp != null && SystemClock.uptimeMillis() - Math.max(lastWelcome, tcpUpAt) > TCP_STALE_MS) {
+                closeTcp();
+            }
             if (connected && SystemClock.uptimeMillis() - lastWelcome > LOST_AFTER_MS) {
                 connected = false;
                 session = null;
@@ -346,7 +354,7 @@ public class MainActivity extends Activity {
     };
 
     private void sendHello() {
-        if (viewW <= 0 || viewH <= 0) return;
+        if (socket == null || viewW <= 0 || viewH <= 0) return;
         helloNonce = new byte[8];
         random.nextBytes(helloNonce);
         ByteBuffer b = packet(HELLO, 20);
@@ -420,10 +428,14 @@ public class MainActivity extends Activity {
         });
     }
 
+    /** UI thread. The size goes straight into volatile fields: routed through the net
+     *  handler it could be dropped by stopNet() (pause right after a cold start), and
+     *  onSizeChanged never fires again for an unchanged size, leaving the app mute. */
     void onViewSize(int w, int h) {
+        viewW = w;
+        viewH = h;
         Handler n = net;
-        if (n != null) n.post(() -> { viewW = w; viewH = h; sendHello(); });
-        else { viewW = w; viewH = h; }
+        if (n != null) n.post(this::sendHello);
     }
 
     private ByteBuffer packet(byte type, int bodyLen) {

@@ -59,6 +59,8 @@ MAC_LEN = 16
 # longer than this means packets are being lost, so lift the fingers.
 TOUCH_TIMEOUT = 0.25
 MAX_SESSIONS = 4
+# The app sends a HELLO at least every 2 s; a USB connection silent this long is dead.
+TCP_SILENT_S = 5.0
 
 
 # ---------------------------------------------------------------- touchpad
@@ -472,6 +474,7 @@ class Server:
         self.listener = socket.create_server(("127.0.0.1", port))
         self.sel.register(self.listener, selectors.EVENT_READ, "listen")
         self.tcp_bufs: dict[socket.socket, bytearray] = {}
+        self.tcp_seen: dict[socket.socket, float] = {}  # last time each USB connection sent data
         self.sessions: dict[bytes, list[int]] = {}  # session -> [last seq]; insertion-ordered
         self.pad: Touchpad | None = None
         self.last_frame = 0.0
@@ -507,6 +510,7 @@ class Server:
                     conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                     conn.setblocking(False)
                     self.tcp_bufs[conn] = bytearray()
+                    self.tcp_seen[conn] = now
                     self.sel.register(conn, selectors.EVENT_READ, "tcp")
                 else:
                     self.read_tcp(key.fileobj, now)
@@ -514,6 +518,11 @@ class Server:
             self.sync_mode()
             if self.gestures:
                 self.gestures.tick(now)
+            # A cable glitch can leave the adb reverse tunnel open at both ends but dead in
+            # the middle; the app heartbeats at least every 2 s, so silence means it's gone.
+            for conn in [c for c, t in self.tcp_seen.items() if now - t > TCP_SILENT_S]:
+                print("USB: tunnel went silent; dropping it so the app reconnects")
+                self.drop_tcp(conn)
             sink = self.sink()
             if sink and sink.ntouch and now - self.last_frame > TOUCH_TIMEOUT:
                 sink.frame({}, now)
@@ -534,6 +543,12 @@ class Server:
         self.remote = remote
         print("phone now drives " + (f"lanmouse target '{self.target}'" if remote else "this PC"))
 
+    def drop_tcp(self, conn: socket.socket) -> None:
+        self.sel.unregister(conn)
+        del self.tcp_bufs[conn]
+        del self.tcp_seen[conn]
+        conn.close()
+
     def read_tcp(self, conn: socket.socket, now: float) -> None:
         try:
             chunk = conn.recv(4096)
@@ -542,10 +557,9 @@ class Server:
         except OSError:
             chunk = b""
         if not chunk:
-            self.sel.unregister(conn)
-            del self.tcp_bufs[conn]
-            conn.close()
+            self.drop_tcp(conn)
             return
+        self.tcp_seen[conn] = now
         buf = self.tcp_bufs[conn]
         buf += chunk
 
