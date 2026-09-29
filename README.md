@@ -54,7 +54,7 @@ swipes stay local-only.
 
 `--diagonal INCHES` (serve / install-service): the phone's screen size, so libinput knows the
 pad's physical size for acceleration and gesture distances (default 5.0).
-`--remote-gain` (default 0.7) and `--[no-]remote-natural-scroll`: pointer speed and scroll
+`--remote-gain` (default 0.5) and `--[no-]remote-natural-scroll`: pointer speed and scroll
 direction on lanmouse receivers. `--lanmouse PATH` / `--no-lanmouse`: lanmouse integration.
 `--no-usb`: Wi-Fi only. `--port`: UDP/TCP port (default 47474).
 

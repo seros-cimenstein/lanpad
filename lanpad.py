@@ -796,7 +796,7 @@ def main() -> None:
                             f"targets another machine the phone drives '{POINTER_NAME}' instead "
                             "(default %(default)s, ignored if missing)")
         p.add_argument("--no-lanmouse", action="store_true", help="never follow lanmouse")
-        p.add_argument("--remote-gain", type=float, default=0.7,
+        p.add_argument("--remote-gain", type=float, default=0.5,
                        help="pointer speed on lanmouse targets; 1.0 = finger travel counted like a "
                             "1000 dpi mouse (default %(default)s)")
         p.add_argument("--remote-natural-scroll", action=argparse.BooleanOptionalAction, default=True,
