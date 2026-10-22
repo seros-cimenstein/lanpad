@@ -643,8 +643,11 @@ def usb_link_loop(adb: str, port: int, idle_for) -> None:
 
     while True:
         try:
-            out = run(adb, "devices").stdout
-            serials = {ln.split()[0] for ln in out.splitlines()[1:] if ln.endswith("\tdevice")}
+            # Only cable-attached phones (`usb:` in -l output). Network adb devices (e.g. over
+            # Tailscale) are skipped: polling them every second keeps the phone's radio awake.
+            out = run(adb, "devices", "-l").stdout
+            serials = {f[0] for f in (ln.split() for ln in out.splitlines()[1:])
+                       if len(f) >= 2 and f[1] == "device" and any(x.startswith("usb:") for x in f[2:])}
             for serial in serials:
                 a = (adb, "-s", serial)
                 if f"tcp:{port}" not in run(*a, "reverse", "--list").stdout:
