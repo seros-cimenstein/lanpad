@@ -43,7 +43,7 @@ APP_ACTIVITY = f"{APP_PACKAGE}/.MainActivity"
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "lanpad"
 KEY_FILE = CONFIG_DIR / "key"
 UNIT_NAME = "lanpad.service"
-LANMOUSE_CONFIG = Path.home() / ".config" / "lanmouse-indicator" / "config.json"
+KBFOLLOW_CONFIG = Path.home() / ".config" / "kbfollow-indicator" / "config.json"
 DEFAULT_PORT = 47474
 
 DEVICE_NAME = "LanPad"
@@ -247,19 +247,19 @@ def load_key() -> bytes:
         sys.exit(f"no pairing key at {KEY_FILE}; run: {sys.argv[0]} pair")
 
 
-# ---------------------------------------------------------------- remote (lanmouse) mode
+# ---------------------------------------------------------------- remote (kbfollow) mode
 
-POINTER_NAME = "LanPad pointer"  # lanmouse's sender forwards it when its mouse_match lists this name
+POINTER_NAME = "LanPad pointer"  # kbfollow's sender forwards it when its mouse_match lists this name
 TAP_MAX_S = 0.18          # libinput's tap timeout
 TAP_MAX_MOVE_MM = 1.5     # more travel than this makes a touch a move, not a tap
 TAP_DRAG_WINDOW_S = 0.18  # a touch starting this soon after a tap is a double-tap or tap-and-drag
 COUNTS_PER_MM = 1000 / 25.4   # like a 1000 dpi mouse; the receiver's libinput adds acceleration
 SCROLL_HIRES_PER_MM = 12      # 120 hi-res units = one wheel detent per 10 mm of two-finger travel
-LANMOUSE_POLL_S = 0.1
+KBFOLLOW_POLL_S = 0.1
 
 
 class Pointer:
-    """Relative uinput mouse. lanmouse only carries mouse events (REL + buttons), so this is
+    """Relative uinput mouse. kbfollow only carries mouse events (REL + buttons), so this is
     what a remote target gets instead of the touchpad."""
 
     def __init__(self) -> None:
@@ -439,28 +439,28 @@ class RemoteGestures:
             self.ptr.ui.syn()
 
 
-def lanmouse_target_loop(status_url: str, token: str, server: "Server") -> None:
-    """Follow lanmouse's keyboard-driven target ('local' or a receiver name)."""
+def kbfollow_target_loop(status_url: str, token: str, server: "Server") -> None:
+    """Follow kbfollow's keyboard-driven target ('local' or a receiver name)."""
     last = None
     while True:
         try:
-            req = urllib.request.Request(status_url, headers={"X-Lanmouse-Token": token})
+            req = urllib.request.Request(status_url, headers={"X-Kbfollow-Token": token})
             with urllib.request.urlopen(req, timeout=1) as resp:
                 target = str(json.load(resp).get("target", "local"))
         except (OSError, ValueError):
             target = "local"  # sender unreachable: behave as a plain local touchpad
         if target != last:
-            print(f"lanmouse: target {target}")
+            print(f"kbfollow: target {target}")
             last = target
         server.target = target
-        time.sleep(LANMOUSE_POLL_S)
+        time.sleep(KBFOLLOW_POLL_S)
 
 
 class Server:
     """Accepts the app's packets over Wi-Fi (UDP, any interface) and over USB (TCP on
     loopback, reached by the phone through `adb reverse`; TCP frames are u16-length prefixed).
-    Frames drive the local touchpad, or — while lanmouse targets another machine — the
-    relative "LanPad pointer" that lanmouse forwards there."""
+    Frames drive the local touchpad, or — while kbfollow targets another machine — the
+    relative "LanPad pointer" that kbfollow forwards there."""
 
     def __init__(self, key: bytes, port: int, diagonal: float, pointer: Pointer | None,
                  remote_gain: float, natural_scroll: bool):
@@ -484,7 +484,7 @@ class Server:
         self.remote_gain = remote_gain
         self.natural_scroll = natural_scroll
         self.gestures: RemoteGestures | None = None
-        self.target = "local"   # written by lanmouse_target_loop
+        self.target = "local"   # written by kbfollow_target_loop
         self.remote = False
 
     def mac(self, data: bytes) -> bytes:
@@ -531,7 +531,7 @@ class Server:
         return self.gestures if self.remote else self.pad
 
     def sync_mode(self) -> None:
-        """Switch between local touchpad and remote pointer when lanmouse's target changes,
+        """Switch between local touchpad and remote pointer when kbfollow's target changes,
         lifting fingers on the side being left so nothing stays pressed."""
         remote = self.target != "local" and self.gestures is not None
         if remote == self.remote:
@@ -541,7 +541,7 @@ class Server:
         elif not remote and self.gestures:
             self.gestures.reset()
         self.remote = remote
-        print("phone now drives " + (f"lanmouse target '{self.target}'" if remote else "this PC"))
+        print("phone now drives " + (f"kbfollow target '{self.target}'" if remote else "this PC"))
 
     def drop_tcp(self, conn: socket.socket) -> None:
         self.sel.unregister(conn)
@@ -670,21 +670,21 @@ def usb_link_loop(adb: str, port: int, idle_for) -> None:
         time.sleep(1)
 
 
-def load_lanmouse(path: Path) -> tuple[str, str] | None:
-    """(status_url, token) from a lanmouse-indicator config, or None if there is none."""
+def load_kbfollow(path: Path) -> tuple[str, str] | None:
+    """(status_url, token) from a kbfollow-indicator config, or None if there is none."""
     try:
         cfg = json.loads(path.read_text())
         return str(cfg["status_url"]), str(cfg["token"])
     except FileNotFoundError:
         return None
     except (OSError, ValueError, KeyError) as ex:
-        sys.exit(f"cannot use lanmouse config {path}: {ex}")
+        sys.exit(f"cannot use kbfollow config {path}: {ex}")
 
 
 def cmd_serve(args) -> None:
     sys.stdout.reconfigure(line_buffering=True)
-    lanmouse = None if args.no_lanmouse else load_lanmouse(Path(args.lanmouse).expanduser())
-    pointer = Pointer() if lanmouse else None
+    kbfollow = None if args.no_kbfollow else load_kbfollow(Path(args.kbfollow).expanduser())
+    pointer = Pointer() if kbfollow else None
     server = Server(load_key(), args.port, args.diagonal, pointer, args.remote_gain,
                     args.remote_natural_scroll)
 
@@ -696,9 +696,9 @@ def cmd_serve(args) -> None:
     if adb:
         threading.Thread(target=usb_link_loop, daemon=True,
                          args=(adb, args.port, lambda: time.monotonic() - server.last_packet)).start()
-    if lanmouse:
-        threading.Thread(target=lanmouse_target_loop, args=(*lanmouse, server), daemon=True).start()
-        print(f"lanmouse: following {lanmouse[0]}; remote targets get '{POINTER_NAME}'")
+    if kbfollow:
+        threading.Thread(target=kbfollow_target_loop, args=(*kbfollow, server), daemon=True).start()
+        print(f"kbfollow: following {kbfollow[0]}; remote targets get '{POINTER_NAME}'")
     print(f"listening: Wi-Fi udp/{args.port}" + (", USB via adb reverse" if adb else "")
           + "; open LanPad on the phone")
     try:
@@ -765,9 +765,9 @@ def cmd_pair(args) -> None:
 def serve_flags(args) -> list[str]:
     """The serve options in `args`, as command-line flags for the unit file."""
     flags = ["--diagonal", str(args.diagonal), "--remote-gain", str(args.remote_gain),
-             "--lanmouse", args.lanmouse,
+             "--kbfollow", args.kbfollow,
              "--remote-natural-scroll" if args.remote_natural_scroll else "--no-remote-natural-scroll"]
-    flags += ["--no-usb"] * args.no_usb + ["--no-lanmouse"] * args.no_lanmouse
+    flags += ["--no-usb"] * args.no_usb + ["--no-kbfollow"] * args.no_kbfollow
     return flags
 
 
@@ -808,16 +808,16 @@ def main() -> None:
                             "for acceleration and gestures (default 5.0)")
         p.add_argument("--no-usb", action="store_true",
                        help="Wi-Fi only: don't manage `adb reverse` for USB-connected phones")
-        p.add_argument("--lanmouse", default=str(LANMOUSE_CONFIG),
-                       help="lanmouse-indicator config with status_url and token; while lanmouse "
+        p.add_argument("--kbfollow", default=str(KBFOLLOW_CONFIG),
+                       help="kbfollow-indicator config with status_url and token; while kbfollow "
                             f"targets another machine the phone drives '{POINTER_NAME}' instead "
                             "(default %(default)s, ignored if missing)")
-        p.add_argument("--no-lanmouse", action="store_true", help="never follow lanmouse")
+        p.add_argument("--no-kbfollow", action="store_true", help="never follow kbfollow")
         p.add_argument("--remote-gain", type=float, default=0.5,
-                       help="pointer speed on lanmouse targets; 1.0 = finger travel counted like a "
+                       help="pointer speed on kbfollow targets; 1.0 = finger travel counted like a "
                             "1000 dpi mouse (default %(default)s)")
         p.add_argument("--remote-natural-scroll", action=argparse.BooleanOptionalAction, default=True,
-                       help="natural two-finger scrolling on lanmouse targets (default on)")
+                       help="natural two-finger scrolling on kbfollow targets (default on)")
     argv = sys.argv[1:]
     args = ap.parse_args(argv)
     if args.cmd is None:
