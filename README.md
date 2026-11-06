@@ -35,17 +35,31 @@ Hold the phone in landscape with its top on the left.
 
 Logs: `journalctl --user -u lanpad.service -f`
 
-## Following lanmouse between machines
+### Android SDK pieces
 
-If a [lanmouse](../lanmouse) sender runs on this PC, LanPad follows its keyboard-driven
-target (read from `~/.config/lanmouse-indicator/config.json`: `status_url`, `token`):
+The SDK is not part of this repository. `android/build.sh` (run by `pair`) needs only two
+packages from Google's repository and fetches them into `.sdk/` (about 150 MB unpacked):
+
+- `https://dl.google.com/android/repository/build-tools_r37_linux.zip` → `.sdk/android-37.0/`
+  (`aapt`, `aapt2`, `d8`, `zipalign`, `apksigner`)
+- `https://dl.google.com/android/repository/platform-30_r03.zip` → `.sdk/android-11/android.jar`
+
+To use build-tools and a platform jar you already have, set `ANDROID_BUILD_TOOLS=<dir>` and
+`ANDROID_JAR=<path>/android.jar`; then nothing is downloaded. The APK is signed with the
+standard Android debug key (`~/.android/debug.keystore`, created if missing).
+
+## Following kbfollow between machines
+
+If a [kbfollow](https://github.com/seros-cimenstein/lan-tools/tree/main/kbfollow) sender
+(formerly called lanmouse) runs on this PC, LanPad follows its keyboard-driven target (read
+from `~/.config/kbfollow-indicator/config.json`: `status_url`, `token`):
 
 - target `local`: the phone is this PC's native touchpad, as above;
 - target is a receiver (`laptop`, `desktop`, …): the phone drives a relative mouse,
-  `LanPad pointer`, which lanmouse grabs and forwards over its existing connection. The sender's
+  `LanPad pointer`, which kbfollow grabs and forwards over its existing connection. The sender's
   `mouse_match` must list it, e.g. `["Logitech M215", "LanPad pointer"]`.
 
-lanmouse only carries mouse events, so on a receiver LanPad interprets gestures itself, with
+kbfollow only carries mouse events, so on a receiver LanPad interprets gestures itself, with
 libinput's conventions: move, tap = left click, two-finger tap = right, three-finger tap =
 middle, double-tap, tap-and-drag, two-finger (natural) scrolling. Pinch and three/four-finger
 swipes stay local-only.
@@ -55,7 +69,7 @@ swipes stay local-only.
 `--diagonal INCHES` (serve / install-service): the phone's screen size, so libinput knows the
 pad's physical size for acceleration and gesture distances (default 5.0).
 `--remote-gain` (default 0.5) and `--[no-]remote-natural-scroll`: pointer speed and scroll
-direction on lanmouse receivers. `--lanmouse PATH` / `--no-lanmouse`: lanmouse integration.
+direction on kbfollow receivers. `--kbfollow PATH` / `--no-kbfollow`: kbfollow integration.
 `--no-usb`: Wi-Fi only. `--port`: UDP/TCP port (default 47474).
 
 ## How it works
@@ -71,3 +85,14 @@ direction on lanmouse receivers. `--lanmouse PATH` / `--no-lanmouse`: lanmouse i
 
 Wire format (big endian): `"LPD1" | type:u8 | body | mac[16]`, see `MainActivity.java`.
 Over USB each packet is prefixed with a u16 length.
+
+## Status and limitations
+
+- Developed with a single Android phone and a sway desktop; other phones, panels and
+  compositors are untested.
+- Linux only (uinput, libinput). The phone app is sideloaded with a debug key.
+- Packets are authenticated, not encrypted. Not security-audited.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
